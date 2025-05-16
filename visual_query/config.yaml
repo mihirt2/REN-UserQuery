@@ -1,0 +1,72 @@
+data: 
+  train_data_dir: '/path/to/vq2d/records/train/'
+  val_data_dir: '/path/to/vq2d/records/val/'
+  test_data_dir: '/path/to/vq2d/records/test/'
+  sam2_ckpt: '/path/to/sam2.1_hiera_large.pt'
+  num_train_examples: 1
+  num_val_examples: 1
+  num_test_examples: 1
+
+visual_query:
+  split: 'val'
+  feature_extractor: 'dino'
+  patch_size: 8
+  batch_size: 1
+  query_cropping_factors:
+    - 1.0
+    - 1.25
+    - 1.5
+    - 1.75
+    - 2.0
+    - 2.25
+    - 2.5
+    - 2.75
+  frame_cropping_factors:
+    - 1.0
+    - 2.0
+  selection_top_k: 25
+  selection_top_p: 0.7
+  refinement_top_p: 0.7
+  refinement_min_score: 0.6
+  tracking_top_p: 0.75
+  nms_threshold: 0.8
+  query_selection_threshold: 0.5
+  track_selection_threshold: 0.7
+  tracker_name: 'sam2'
+  tracker_param: 'configs/sam2.1/sam2.1_hiera_l.yaml'
+  save_dir: 'logs/'
+  exp_name: 'ren-dinov2-val'
+
+ren:
+  pretrained:
+    feature_extractors:
+      - 'dinov2_vitl14'
+    patch_sizes:
+      - 14
+    region_extractor: 'sam2_hierra'
+    sam2_hieral_ckpt: '/path/to/sam2.1_hiera_large.pt'
+    sam2_hieral_config: 'configs/sam2.1/sam2.1_hiera_l.yaml'
+
+  architecture:
+    grid_size: 32
+    hidden_dim: 1024
+    decoder_layers: 4
+    num_attention_heads: 8
+
+  parameters:
+    image_resolution: 518
+    batch_size: 16
+    learning_rate: 0.001
+    num_epochs: 50
+    max_prompts: 256
+    accumulation_steps: 1
+    warmup_steps: 100
+    logging_steps: 25
+    max_grad_norm: 5.0
+    upsample_features: False
+    deduplicate_masks: False
+    num_workers: 16
+
+  logging:
+    save_dir: '../logs/'
+    exp_name: 'ren-dinov2-vitl14'
