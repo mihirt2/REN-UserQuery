@@ -1,7 +1,7 @@
 # REN: Fast and Efficient Region Encodings from Patch-Based Image Encoders
 **Authors**: [Savya Khosla](https://savya08.github.io/), [Sethuraman TV](https://github.com/sethuramanio), [Barnett Lee](https://barnettlee.com/), [Alexander Schwing](https://www.alexander-schwing.de/), [Derek Hoiem](https://dhoiem.cs.illinois.edu/)
 
-[![ArXiv](https://img.shields.io/badge/arXiv-Paper-b31b1b.svg)]()
+[![ArXiv](https://img.shields.io/badge/arXiv-Paper-b31b1b.svg)](https://arxiv.org/abs/2505.18153)
 
 
 Region Encoder Network (REN) is a lightweight model for extracting semantically meaningful region-level representations from images using point prompts. It operates on frozen patch-based vision encoder features, avoids explicit segmentation, and supports both training-free and task-specific setups across a range of vision tasks.
@@ -58,7 +58,7 @@ xren = XREN(config)
 region_tokens = xren(image)
 ```
 
-See `test.py` for examples of how to load REN/XREN and process images.
+See [`test.py`](test.py) for examples of how to load REN/XREN and process images.
 
 
 ## Training REN
@@ -74,7 +74,7 @@ SAM 2 masks are used to guide the training losses. Specifically, we use [SAM 2.1
 
 
 ### 3. Setup Config
-To train REN with DINOv2 ViT-L/14, use `configs/train_dinov2_vitl14.yaml`. Make sure to update the following paths in the config:
+To train REN with DINOv2 ViT-L/14, use [`configs/train_dinov2_vitl14.yaml`](configs/train_dinov2_vitl14.yaml). Make sure to update the following paths in the config:
 ```
 # Path to COCO2017 dataset
 coco_train_images_dir: '/path/to/coco2017/train2017/'
@@ -102,22 +102,22 @@ The checkpoint is saved at `logs/ren-dinov2-vitl14/checkpoint.pth`, as specified
 
 Note: The `--feature_extractor` argument must match the name of the corresponding YAML file in `configs/`, i.e., `train_<feature_extractor>.yaml`.
 
-To add support for a new image encoder, update the `FeatureExtractor` class in `model.py` with the corresponding feature extraction logic, and add a corresponding config file to `configs/`.
+To add support for a new image encoder, update the `FeatureExtractor` class in [`model.py`](https://github.com/savya08/REN/blob/aee7645608dba43a16241ad081a991e5b376d66d/model.py#L16) with the corresponding feature extraction logic, and add a corresponding config file to `configs/`.
 
 
 ## License
-This project is released under the MIT License. See `LICENSE` for details.
+This project is released under the MIT License. See [`LICENSE`](LICENSE) for details.
 
 
 ## Citing REN
 ```
-@misc{khosla2025ren,
+@misc{khosla2025renfastefficientregion,
       title={REN: Fast and Efficient Region Encodings from Patch-Based Image Encoders}, 
-      author={Savya Khosla and Sethuraman T V and Barnett Lee and Alexander Schwing and Derek Hoiem},
+      author={Savya Khosla and Sethuraman TV and Barnett Lee and Alexander Schwing and Derek Hoiem},
       year={2025},
-      eprint={},
+      eprint={2505.18153},
       archivePrefix={arXiv},
       primaryClass={cs.CV},
-      url={}, 
+      url={https://arxiv.org/abs/2505.18153}, 
 }
 ```
