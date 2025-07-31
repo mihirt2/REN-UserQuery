@@ -139,7 +139,7 @@ class Evaluator():
 
         # Instantiate the dataloaders
         self.target_data = config['data']['target_data']
-        if self.target_data == 'voc2012':
+        if self.target_data == 'pascal_voc':
             dataset = VOCSegmentation(config, image_set='trainval', augment=False)
             train_size = int(0.9 * len(dataset))
             val_size = len(dataset) - train_size
@@ -164,7 +164,7 @@ class Evaluator():
         self.feature_extractor = FeatureExtractor(config['ren'], device=device)
         self.region_encoder = RegionEncoder(config['ren']).to(device).eval()
         self.token_aggregator = TokenAggregator(config['ren'])
-        if self.target_data == 'voc2012':
+        if self.target_data == 'pascal_voc':
             self.decoder = VOCDecoderLinear(config).to(device).eval()
         elif self.target_data == 'ade20k':
             self.decoder = ADEDecoderLinear(config).to(device).eval()
@@ -255,7 +255,7 @@ class Evaluator():
                 if aggregate_tokens:
                     aggregated_outputs = self.token_aggregator(ren_outputs['pred_tokens'], ren_outputs['proj_tokens'],
                                                                ren_outputs['attn_scores'][-1], prompts)
-                    region_tokens = aggregated_outputs['filtered_pred_tokens']
+                    region_tokens = aggregated_outputs['aggregated_pred_tokens']
                     grouped_points = aggregated_outputs['all_grouped_points']
                     
                     padded_region_tokens = []
