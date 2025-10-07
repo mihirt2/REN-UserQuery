@@ -1,8 +1,6 @@
 import os, cv2, json, yaml, argparse
 import numpy as np
 import torch
-# SLIC: Selective Localization and Instance Calibration for Knowledge-Enhanced Car Damage Segmentation in Automotive Insurance
-# Cluster pixels with similar 
 from ren import REN 
 from visual_query.models import CandidateSelector, CandidateRefiner, VisualQueryTracker
 from visual_query.vq_utils import crop_using_bbox, generate_token_from_bbox, print_log
