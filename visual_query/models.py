@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
-from vq_utils import crop_using_bbox, mask_to_bbox, point_to_bbox, sliding_window_cropping, \
+from visual_query.vq_utils import crop_using_bbox, mask_to_bbox, point_to_bbox, sliding_window_cropping, \
     generate_token_from_bbox, get_sam_pooled_tokens, get_cropping_factor
 
 sys.path.append('..')
@@ -53,7 +53,7 @@ class REN(nn.Module):
     
     def load_checkpoint(self):
         if os.path.exists(self.checkpoint_path):
-            checkpoint = torch.load(self.checkpoint_path)
+            checkpoint = torch.load(self.checkpoint_path, map_location=torch.device("cpu"))
             self.start_epoch = checkpoint['epoch']
             self.start_iter = checkpoint['iter_count']
             self.region_encoder.load_state_dict(checkpoint['region_encoder_state'])
@@ -250,7 +250,7 @@ class VideoEncoder(nn.Module):
 class CandidateSelector(nn.Module):
     def __init__(self):
         super(CandidateSelector, self).__init__()
-
+    # Compute the object scores at a particular frame
     def intra_frame_nms(self, object_scores, object_idxs, frame_ids, query_frame_number):
         selected_object_scores = object_scores.clone()
         unique_frame_ids = torch.unique(frame_ids)
@@ -277,7 +277,7 @@ class CandidateSelector(nn.Module):
                 selected_object_scores[idx] = 0.0
                 idx -= 1
         return selected_object_scores, selected_object_idxs
-    
+    # Compute the scores of the objects over time 
     def inter_frame_nms(self, object_scores, object_idxs, frame_ids, nms_threshold=None, nms_window=None):
         selected_object_scores, selected_object_idxs = [], []
 

@@ -68,7 +68,7 @@ class CandidateSelection():
     
     def run(self, config, object_tokens, query_tokens, object_attn_mask, frame_ids, query_frame_numbers, object_points,
             frames, query_bboxes, query_timestep, response_track, visualize_results=False, save_dir='.'):
-        model = CandidateSelector()
+        model = CandidateSelector() # Choses the best object of the ones available
         selected_object_info = model(object_tokens, query_tokens, object_attn_mask, frame_ids, query_frame_numbers[0][0],
                                      top_k=config['selection_top_k'], top_p=config['selection_top_p'],
                                      nms_threshold=config['nms_threshold'])
@@ -403,7 +403,7 @@ def run(config, refine_selected_candidates=True, refine_tracks=True, cache_predi
                                      run_id=run_id, config=config)
         dataloader = DataLoader(dataset, batch_size=config['visual_query']['batch_size'], num_workers=0)
         
-    elif config['visual_query']['split'] == 'val':
+    elif config['visual_query']['split'] == 'val': # val = validation
         dataset = VisualQueryDataset(data_dir=config['data']['val_data_dir'],
                                      num_examples=config['data']['num_val_examples'],
                                      run_id=run_id, config=config)

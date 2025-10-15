@@ -10,6 +10,12 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
 from pycocotools import mask as mask_utils
+import importlib.resources as ir
+from hydra import initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+import contextlib
 
 sys.path.append('../segment_anything/')
 from sam2.build_sam import build_sam2  # type: ignore
@@ -71,25 +77,64 @@ def extract_dino(model, images, batch_size=32, patch_length=8, layers=[11]):
 
 
 def extract_dino_v2(model, images, batch_size=128, patch_length=14, layers=[23]):
-    transform = T.Compose([T.ToTensor(),
-                           lambda x: x.unsqueeze(0),
-                           CenterPadding(multiple=patch_length),
-                           T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))])
-    
+    # Accept: list/iter of images, or a numpy batch [N,H,W,3], or a torch batch [N,3,H,W]/[N,H,W,3]
+    # Convert each item to numpy HWC uint8 before transforms.
+    def _as_numpy_hwc(img):
+        if isinstance(img, np.ndarray):
+            # Expect HWC; if CHW, convert; if dtype not uint8, scale/clamp
+            if img.ndim == 3 and img.shape[-1] == 3:
+                arr = img
+            elif img.ndim == 3 and img.shape[0] == 3:
+                arr = np.transpose(img, (1, 2, 0))
+            else:
+                raise ValueError(f"extract_dino_v2: unsupported numpy shape {img.shape}")
+            if arr.dtype != np.uint8:
+                arr = arr.astype(np.float32)
+                if arr.max() <= 1.0:
+                    arr = (arr * 255.0).clip(0, 255)
+                else:
+                    arr = arr.clip(0, 255)
+                arr = arr.astype(np.uint8)
+            return arr
+        if torch.is_tensor(img):
+            return _to_numpy_rgb(img)  # your helper: returns HWC uint8
+        raise TypeError(f"extract_dino_v2: unsupported image type {type(img)}")
+
+    # If images is a batch array/tensor, iterate over first dimension
+    items = []
+    if isinstance(images, np.ndarray) and images.ndim == 4:
+        items = [images[i] for i in range(images.shape[0])]
+    elif torch.is_tensor(images) and images.ndim == 4:
+        items = [images[i] for i in range(images.shape[0])]
+    else:
+        # assume iterable of images
+        items = list(images)
+
+    transform = T.Compose([
+        T.ToTensor(),
+        # keep original spatial size; padding handles patch grid
+        CenterPadding(multiple=patch_length),
+        T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
+
     transformed_images = []
-    for image in images:
-        transformed_images.append(transform(image).to(device=device, dtype=torch.bfloat16))
-    transformed_images = torch.cat(transformed_images, dim=0)
-    
+    for image in items:
+        np_img = _as_numpy_hwc(image)           # HWC uint8
+        tens = transform(np_img)                # [3,H,W], float
+        transformed_images.append(tens.unsqueeze(0))
+    transformed_images = torch.cat(transformed_images, dim=0)  # [B,3,H,W]
+
     features = []
     for i in range(0, transformed_images.shape[0], batch_size):
-        image_batch = transformed_images[i:(i + batch_size)]
+        image_batch = transformed_images[i:(i + batch_size)].to(device=device, dtype=torch.bfloat16)
         with torch.inference_mode():
-            features_out = model.get_intermediate_layers(image_batch, n=layers, reshape=True)
-            features.append(torch.cat(features_out, dim=1))
+            # DINOv2 returns list of features when reshape=True
+            feats = model.get_intermediate_layers(image_batch, n=layers, reshape=True)
+            features.append(torch.cat(feats, dim=1))
             torch.cuda.empty_cache()
     features = torch.cat(features, dim=0)
     return features.detach().to(torch.float32)
+
 
 
 def extract_sam(model, images, batch_size=4):
@@ -135,7 +180,99 @@ def extract_sam2(model, images, batch_size=16):
     features = torch.cat(features, dim=0)
     return features.detach().cpu().to(torch.float32)
 
+import os
+from hydra import initialize, initialize_config_dir, compose
+from omegaconf import OmegaConf
 
+# in visual_query/vq_utils.py (where you defined resolve_sam2_cfg)
+from hydra import initialize, initialize_config_dir, compose
+from hydra.core.global_hydra import GlobalHydra
+from omegaconf import OmegaConf
+import os, importlib.resources as ir
+
+import contextlib
+
+def _to_numpy_rgb(frame):
+    """Accepts torch tensor [H,W,3] or [3,H,W] or [B,3,H,W] (B must be 1), or np.ndarray.
+       Returns np.ndarray [H,W,3] uint8 in RGB."""
+    if isinstance(frame, np.ndarray):
+        if frame.ndim != 3 or frame.shape[-1] != 3:
+            raise ValueError(f"Expected numpy [H,W,3], got {frame.shape}")
+        if frame.dtype != np.uint8:
+            # assume 0..1 or 0..255 floats/ints; clamp and cast
+            arr = np.clip(frame, 0, 255).astype(np.float32)
+            if arr.max() <= 1.0:
+                arr = arr * 255.0
+            return arr.astype(np.uint8)
+        return frame
+
+    if isinstance(frame, torch.Tensor):
+        t = frame.detach().cpu()
+        # handle batch
+        if t.ndim == 4:
+            if t.shape[0] != 1:
+                raise ValueError(f"Batch >1 not supported here, got {tuple(t.shape)}")
+            t = t[0]
+        # CHW or HWC
+        if t.ndim == 3 and t.shape[0] == 3:     # [3,H,W] -> [H,W,3]
+            t = t.permute(1, 2, 0)
+        elif t.ndim == 3 and t.shape[-1] == 3:  # already [H,W,3]
+            pass
+        else:
+            raise ValueError(f"Unexpected tensor shape {tuple(t.shape)}")
+        arr = t.numpy()
+        # scale to uint8 if needed
+        if arr.dtype != np.uint8:
+            arr = arr.astype(np.float32)
+            mx = float(arr.max()) if arr.size else 1.0
+            # if already in 0..1 range, scale up; otherwise clamp to 0..255
+            if mx <= 1.0:
+                arr = arr * 255.0
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        return arr
+
+    raise TypeError(f"Unsupported frame type: {type(frame)}")
+
+
+def _build_sam2_predictor(tracker_param: str, sam2_ckpt: str, device: str):
+    """
+    tracker_param: config name relative to installed sam2/configs, e.g. 'sam2.1/sam2.1_hiera_l'
+                   (NO 'configs/' prefix, NO '.yaml' suffix)
+    """
+    name = tracker_param.replace(".yaml", "")
+    if name.startswith("configs/"):  # avoid sam2/configs/configs/...
+        name = name[len("configs/"):]
+
+    cfg_dir = str(ir.files("sam2").joinpath("configs"))  # .../site-packages/sam2/configs
+
+    # (re)initialize Hydra so compose() inside build_sam2 works *now*
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+
+    with initialize_config_dir(config_dir=cfg_dir, version_base=None):
+        sam2_model = build_sam2(name, sam2_ckpt, device=device)
+    return SAM2ImagePredictor(sam2_model)
+
+def resolve_sam2_cfg(tracker_param: str):
+    """
+    Accepts either a config NAME like 'sam2.1/sam2.1_hiera_l' or
+    an absolute FILE PATH to a .yaml. Returns an OmegaConf.
+    """
+    # 1) If it's a real file path, load directly (no Hydra compose)
+    if os.path.isfile(tracker_param):
+        return OmegaConf.load(tracker_param)
+
+    # 2) Otherwise compose relative to installed sam2/configs directory
+    cfg_dir = str(ir.files("sam2").joinpath("configs"))
+    name = tracker_param.replace(".yaml", "")
+    if name.startswith("configs/"):
+        name = name[len("configs/"):]
+
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+
+    with initialize_config_dir(config_dir=cfg_dir, version_base=None):
+        return compose(config_name=name)
 def extract_image_features(images, config):
     feature_extractor = config['visual_query']['feature_extractor']
     if feature_extractor == 'dino':
@@ -173,6 +310,76 @@ def refine_mask(mask):
     refined_mask = np.zeros_like(mask)
     refined_mask[labels == largest_component_label] = 1
     return refined_mask
+
+def _grid_from_lengths(n_tokens: int, mask_hw, patch_size: int):
+    """
+    Infer (G_h, G_w) from n_tokens and mask size/patch size.
+    For square-ish grids we try round numbers around H/patch_size and W/patch_size.
+    """
+    import math
+    H, W = mask_hw
+    # expected grids near these
+    gh_guess = max(1, round(H / patch_size))
+    gw_guess = max(1, round(W / patch_size))
+
+    # try a few nearby factors to match n_tokens
+    candidates = []
+    for dh in (-1, 0, 1, 2):
+        for dw in (-1, 0, 1, 2):
+            gh = max(1, gh_guess + dh)
+            gw = max(1, gw_guess + dw)
+            if gh * gw == n_tokens:
+                candidates.append((gh, gw))
+    if candidates:
+        # prefer the one closest to ratio H/W
+        target_ratio = H / max(1, W)
+        gh, gw = min(candidates, key=lambda p: abs((p[0] / max(1, p[1])) - target_ratio))
+        return gh, gw
+
+    # fallback: square-ish
+    r = int(round(n_tokens ** 0.5))
+    if r * r == n_tokens:
+        return r, r
+
+    # last resort: 1 x n
+    return 1, n_tokens
+
+
+def _unpack_obj(o):
+    """
+    Returns (feat[1,D], point or None, attn_or_None) for:
+      - dict with keys 'region_feature', 'point' (optional 'attn_map')
+      - (feature, point) tuple/list
+      - raw feature tensor
+    """
+    import torch
+    if isinstance(o, dict):
+        feat = o.get('region_feature', o.get('feature', None))
+        pt   = o.get('point', None)
+        attn = o.get('attn_map', None)
+        if feat is None:
+            return None, None, None
+        return torch.as_tensor(feat).unsqueeze(0), pt, attn
+    if isinstance(o, (list, tuple)) and len(o) >= 2:
+        feat, pt = o[0], o[1]
+        return torch.as_tensor(feat).unsqueeze(0), pt, None
+    if torch.is_tensor(o):
+        # raw [D] or [1,D]
+        return (o.unsqueeze(0) if o.ndim == 1 else o), None, None
+    return None, None, None
+
+
+def _normalize_point(p):
+    """Return (py, px) ints or None."""
+    if p is None:
+        return None
+    import numpy as np, torch
+    if isinstance(p, torch.Tensor):
+        p = p.detach().cpu().numpy()
+    p = np.asarray(p).squeeze()
+    if p.ndim == 0 or p.shape[0] < 2:
+        return None
+    return int(p[0]), int(p[1])
 
 
 def get_sam_regions(sam, frames, bboxes=None, input_points=None, img_resolution=1024, batch_size=4,
@@ -259,99 +466,256 @@ def get_sam_regions(sam, frames, bboxes=None, input_points=None, img_resolution=
 
 def get_sam_region_from_bbox(sam2_ckpt, tracker_param, frames, bboxes):
     masks = []
-    predictor = SAM2ImagePredictor(build_sam2(f'{tracker_param}', sam2_ckpt, device=device))
+    predictor = _build_sam2_predictor(tracker_param, sam2_ckpt, device)
+
+    USE_CUDA = torch.cuda.is_available()
+    AMP_CTX = (torch.autocast("cuda", dtype=torch.bfloat16) if USE_CUDA else contextlib.nullcontext())
+
     for frame, bbox in zip(frames, bboxes):
-        with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
-            predictor.set_image(cv2.GaussianBlur(frame, (3, 3), 0))
-            x, y, width, height = bbox
+        img = _to_numpy_rgb(frame)          # <-- convert here
+        # optional: slight blur; cv2 expects BGR
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        img_bgr = cv2.GaussianBlur(img_bgr, (3, 3), 0)
+        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+        with torch.inference_mode(), AMP_CTX:
+            predictor.set_image(img)
+            x, y, w, h = map(int, bbox)     # make sure ints
+            box = np.array([x, y, x + w, y + h])[None]
             mask, _, _ = predictor.predict(
-                point_coords=None,
-                point_labels=None,
-                box=np.array([x, y, x + width, y + height])[None],
-                multimask_output=False,
+                point_coords=None, point_labels=None, box=box, multimask_output=False
             )
-            masks.append(refine_mask(mask[0]))
+        masks.append(refine_mask(mask[0]))
     return masks
 
 
 def get_sam_region_from_points(sam2_ckpt, tracker_param, frames, points):
     masks = []
-    predictor = SAM2ImagePredictor(build_sam2(f'{tracker_param}', sam2_ckpt, device=device))
+    predictor = _build_sam2_predictor(tracker_param, sam2_ckpt, device)
+
+    USE_CUDA = torch.cuda.is_available()
+    AMP_CTX = (torch.autocast("cuda", dtype=torch.bfloat16) if USE_CUDA else contextlib.nullcontext())
+
     for frame, point in zip(frames, points):
-        with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
-            predictor.set_image(cv2.GaussianBlur(frame, (3, 3), 0))
-            y, x = point
+        img = _to_numpy_rgb(frame)  # <-- convert here
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        img_bgr = cv2.GaussianBlur(img_bgr, (3, 3), 0)
+        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+        y, x = map(int, point)
+        with torch.inference_mode(), AMP_CTX:
+            predictor.set_image(img)
             mask, _, _ = predictor.predict(
-                point_coords=np.array([[x, y]]),
-                point_labels=np.array([1]),
-                box=None,
-                multimask_output=True,
+                point_coords=np.array([[x, y]]), point_labels=np.array([1]), box=None, multimask_output=True
             )
-            mask = [refine_mask(m) for m in mask]
-            masks.append(mask)
+        masks.append([refine_mask(m) for m in mask])
     return masks
 
 
-def generate_frame_tokens(feature, masks, pooling_method='average'):
-    frame_tokens = []
-    feature_dim = feature.shape[0]
-    for mask in masks:
-        sam_mask = mask['segmentation'].cpu()
-        r_1, r_2 = np.where(sam_mask == 1)
-
-        if pooling_method == 'average':
-            features_in_sam = feature[:, r_1, r_2].view(feature_dim, -1).mean(1).detach()
-        elif pooling_method == 'max':
-            features_in_sam, _ = torch.max(feature[:, r_1, r_2].view(feature_dim, -1), 1)
-        
-        frame_tokens.append({
-            'region_feature': features_in_sam,
-            'mask': sam_mask,
-            'bbox': mask_to_bbox(sam_mask),
-        })
-    return frame_tokens
-
-
 def generate_token_from_bbox(frames, bboxes, region_encoder, sam2_ckpt, tracker_param, return_attn_maps=False):
-    # Get the masks and region tokens for the frame
-    frame_tokens = region_encoder(frames)
-    selected_masks = get_sam_region_from_bbox(sam2_ckpt, tracker_param, frames, bboxes)
+    """
+    Build one token per input frame using SAM2 masks + region_encoder output.
+    Robust to obj_list being a Tensor/list/tuple/None. Falls back to pooled tokens
+    if no selection is possible across all frames.
 
-    # Generate the tokens
+    Requires helpers: _unpack_obj, _normalize_point, _grid_from_lengths,
+    _to_numpy_rgb, get_sam_region_from_bbox, get_sam_pooled_tokens.
+    """
+    import torch, numpy as np, cv2
+
+    # ---- safe-iteration helpers ----
+    def _iter_objs(obj_list):
+        if obj_list is None:
+            return []
+        if isinstance(obj_list, (list, tuple)):
+            return obj_list
+        if torch.is_tensor(obj_list):
+            if obj_list.ndim == 2:   # [N, D]
+                return [obj_list[i] for i in range(obj_list.shape[0])]
+            if obj_list.ndim == 1:   # [D]
+                return [obj_list]
+            return []
+        return []
+
+    def _len_objs(obj_list):
+        if obj_list is None:
+            return 0
+        if isinstance(obj_list, (list, tuple)):
+            return len(obj_list)
+        if torch.is_tensor(obj_list):
+            if obj_list.ndim == 2:
+                return obj_list.shape[0]
+            if obj_list.ndim == 1:
+                return 1
+            return 0
+        return 0
+
+    # 1) Encode frames via region_encoder (REN)
+    enc = region_encoder(frames)
+
+    # 2) SAM2 masks from the provided bboxes
+    masks = get_sam_region_from_bbox(sam2_ckpt, tracker_param, frames, bboxes)
+
+    # 3) Normalize encoder output into a per-frame list
+    if isinstance(enc, dict):
+        items = sorted(enc.items(), key=lambda kv: int(str(kv[0]).split('-')[-1]))
+        per_frame_obj_lists = [v for _, v in items]
+
+    elif isinstance(enc, (list, tuple)):
+        # already per-frame lists
+        per_frame_obj_lists = list(enc)
+
+    elif torch.is_tensor(enc):
+        # Accept [T,G,D] or [G,D]
+        if enc.ndim == 3:
+            # build per-frame object lists of raw feature tensors [D]
+            T, G, D = enc.shape
+            per_frame_obj_lists = [[enc[t, g] for g in range(G)] for t in range(T)]
+        elif enc.ndim == 2:
+            # single frame [G,D]
+            G, D = enc.shape
+            per_frame_obj_lists = [[enc[g] for g in range(G)]]
+        else:
+            raise ValueError(f"Unexpected encoder tensor shape {tuple(enc.shape)}")
+
+    else:
+        raise TypeError(f"Unexpected encoder output type: {type(enc)}")
+
+    n = min(len(per_frame_obj_lists), len(masks))
+    if n == 0:
+        raise RuntimeError("No frames/masks to process in generate_token_from_bbox")
+
     tokens, attn_maps = [], []
-    for frame_tokens, mask in zip(frame_tokens.values(), selected_masks):
-        if np.sum(mask) == 0:
-            continue
-        selected_token, selected_attn_map = None, None
-        dist_transform = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
-        point_dist = None
-        for object_info in frame_tokens:
-            object_point = object_info['point']
-            point_y, point_x = int(object_point[0]), int(object_point[1])
-            if mask[point_y, point_x] and (point_dist == None or dist_transform[point_y, point_x] > point_dist):
-                selected_token = torch.tensor(object_info['region_feature'])[None]
-                if return_attn_maps:
-                    selected_attn_map = object_info['attn_map']
-                point_dist = dist_transform[point_y, point_x]
-        tokens.append(selected_token)
-        if return_attn_maps:
-            attn_maps.append(selected_attn_map)
-        torch.cuda.empty_cache()
+    any_selected = False
 
-    # Handle cases where no token is generated
-    reference_tensor = None
-    for token in tokens:
-        if token is not None:
-            reference_tensor = torch.zeros_like(token)
-            break
-    for i in range(len(tokens)):
-        if tokens[i] is None:
-            tokens[i] = reference_tensor
-    tokens = torch.cat(tokens)
+    # 4) Per-frame selection
+    for obj_list, mask in zip(per_frame_obj_lists[:n], masks[:n]):
+        m = np.asarray(mask, dtype=np.uint8)
+        if m.size == 0 or m.sum() == 0:
+            tokens.append(None)
+            if return_attn_maps: attn_maps.append(None)
+            continue
+
+        # distance transform for this frame's mask
+        dt = cv2.distanceTransform((m > 0).astype(np.uint8), cv2.DIST_L2, 5)
+
+        best, best_attn, best_d = None, None, -1.0
+
+        # Pass 1: objects that carry explicit points
+        has_any_point = False
+        for o in _iter_objs(obj_list):
+            feat, pt, attn = _unpack_obj(o)
+            if feat is None or pt is None:
+                continue
+            has_any_point = True
+            norm = _normalize_point(pt)
+            if norm is None:
+                continue
+            py, px = norm
+            if not (0 <= py < m.shape[0] and 0 <= px < m.shape[1]):
+                continue
+            if not m[py, px]:
+                continue
+            d = float(dt[py, px])
+            if d > best_d:
+                best, best_attn, best_d = torch.as_tensor(feat), attn, d
+
+        # Pass 2: raw feature tensors without points -> place on inferred grid
+        if best is None and (not has_any_point):
+            n_feat = _len_objs(obj_list)
+            if n_feat > 0:
+                gh, gw = _grid_from_lengths(n_feat, m.shape, 14)
+                ys = np.linspace(0.5 * (m.shape[0] / gh), m.shape[0] - 0.5 * (m.shape[0] / gh), gh).astype(int)
+                xs = np.linspace(0.5 * (m.shape[1] / gw), m.shape[1] - 0.5 * (m.shape[1] / gw), gw).astype(int)
+                for idx, o in enumerate(_iter_objs(obj_list)):
+                    feat, _, attn = _unpack_obj(o)
+                    if feat is None:
+                        continue
+                    gy, gx = divmod(idx, gw)
+                    py, px = ys[min(gy, gh - 1)], xs[min(gx, gw - 1)]
+                    if not m[py, px]:
+                        continue
+                    d = float(dt[py, px])
+                    if d > best_d:
+                        best, best_attn, best_d = torch.as_tensor(feat), attn, d
+
+        tokens.append(best)  # may be None for this frame
+        if return_attn_maps:
+            attn_maps.append(best_attn)
+        any_selected = any_selected or (best is not None)
+
+        # 5) Fallback: if nothing selected across all frames, pool features inside SAM masks
+    if not any_selected:
+        # --- normalize frames to a batched shape ---
+        if torch.is_tensor(frames):
+            if frames.ndim == 3:                     # [3,H,W] or [H,W,3]
+                frames_batched = frames.unsqueeze(0)
+            elif frames.ndim == 4:                   # [N,3,H,W] or [N,H,W,3]
+                frames_batched = frames
+            else:
+                raise ValueError(f"Unsupported tensor frames shape {tuple(frames.shape)}")
+        elif isinstance(frames, np.ndarray):
+            if frames.ndim == 3:                     # [H,W,3]
+                frames_batched = frames[None, ...]
+            elif frames.ndim == 4:                   # [N,H,W,3]
+                frames_batched = frames
+            else:
+                raise ValueError(f"Unsupported numpy frames shape {frames.shape}")
+        else:
+            raise TypeError(f"Unsupported frames type {type(frames)}")
+
+        # --- convert every frame to numpy HWC uint8 so pooled path sees [N,H,W,3] ---
+        frames_np_list = []
+        for i in range(frames_batched.shape[0]):
+            frames_np_list.append(_to_numpy_rgb(frames_batched[i]))
+        frames_np = np.stack(frames_np_list, axis=0)   # [N,H,W,3]
+
+        # --- normalize bboxes to [N,4] to match frames_np ---
+        N = frames_np.shape[0]
+        if torch.is_tensor(bboxes):
+            bb = bboxes.detach().cpu().numpy()
+        elif isinstance(bboxes, np.ndarray):
+            bb = bboxes
+        else:
+            bb = np.asarray(bboxes)
+
+        if bb.ndim == 1 and bb.shape[0] == 4:
+            bboxes_batched = np.repeat(bb[None, :], N, axis=0)
+        elif bb.ndim == 2 and bb.shape[0] in (1, N):
+            bboxes_batched = bb if bb.shape[0] == N else np.repeat(bb, N, axis=0)
+        else:
+            raise ValueError(f"Unsupported bboxes shape for fallback: {bb.shape}")
+
+        # Choose a default feature extractor for fallback (matches your helper)
+        fallback_cfg = {"visual_query": {"feature_extractor": "dinov2"}}
+        patch_size = 14
+
+        pooled = get_sam_pooled_tokens(
+            frames=frames_np,                 # <-- guaranteed [N,H,W,3] numpy
+            bboxes=bboxes_batched,            # [N,4]
+            sam2_ckpt=sam2_ckpt,
+            tracker_param=tracker_param,
+            patch_size=patch_size,
+            config=fallback_cfg,
+        )  # -> [N, D]
+        if return_attn_maps:
+            return pooled, [None] * pooled.shape[0]
+        return pooled
+
+
+    # 6) Replace None with zeros and concatenate
+    ref = next((t for t in tokens if t is not None), None)
+    if ref is None:
+        raise RuntimeError("No token could be selected for any frame (post-fallback).")
+    zero_like = torch.zeros_like(ref)
+    tokens = [t if t is not None else zero_like for t in tokens]
+    tokens = torch.cat(tokens, dim=0)
 
     if return_attn_maps:
         return tokens, attn_maps
     return tokens
+
+
 
 
 def sliding_window_cropping(image, crop_size, overlap=0.2):
