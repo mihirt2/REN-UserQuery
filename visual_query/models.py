@@ -7,25 +7,122 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
-from visual_query.vq_utils import crop_using_bbox, mask_to_bbox, point_to_bbox, sliding_window_cropping, \
-    generate_token_from_bbox, get_sam_pooled_tokens, get_cropping_factor
+from contextlib import nullcontext
+from .vq_utils import (crop_using_bbox, mask_to_bbox, point_to_bbox, sliding_window_cropping, \
+    generate_token_from_bbox, get_sam_pooled_tokens, get_cropping_factor)
 
 sys.path.append('..')
 from model import FeatureExtractor, RegionEncoder
 
 sys.path.append('../segment_anything/')
 from sam2.build_sam import build_sam2_video_predictor  # type: ignore
+import os, shutil, tempfile
+import cv2
+from hydra.core.global_hydra import GlobalHydra
+
+from hydra.core.global_hydra import GlobalHydra
+import os
+from pathlib import Path
+from hydra.core.global_hydra import GlobalHydra
+
+
+def _abs_cfg_root(p: str) -> str:
+    root = Path(str(p).strip()).expanduser().resolve(strict=True)  # raises if not exist
+    return str(root).replace("\\", "/")
+
+try:
+    from hydra import initialize_config_dir as _hydra_initialize_config_dir
+
+    def _hydra_ctx(cfg_root: str):
+        cfg_root = _abs_cfg_root(cfg_root)
+        GlobalHydra.instance().clear()
+        return _hydra_initialize_config_dir(version_base=None, config_dir=cfg_root)
+
+except Exception:
+    # Covers ImportError and any weird runtime import issues
+    try:
+        from hydra.experimental import initialize as _hydra_initialize
+
+        def _hydra_ctx(cfg_root: str):
+            cfg_root = _abs_cfg_root(cfg_root)
+            GlobalHydra.instance().clear()
+            # older API: argument name is config_path
+            return _hydra_initialize(config_path=cfg_root)
+    except Exception as e:
+        raise RuntimeError(f"Hydra initialization is unavailable: {e}")
+
+try:
+    from hydra import initialize_config_dir as _hydra_initialize_config_dir
+    def _hydra_ctx(cfg_root: str):
+        GlobalHydra.instance().clear()
+        cfg_root = os.path.abspath(cfg_root).replace('\\', '/')  # ABSOLUTE + forward slashes
+        return _hydra_initialize_config_dir(version_base=None, config_dir=cfg_root)
+except ImportError:
+    # Older Hydra fallback
+    from hydra.experimental import initialize as _hydra_initialize
+    def _hydra_ctx(cfg_root: str):
+        GlobalHydra.instance().clear()
+        cfg_root = os.path.abspath(cfg_root).replace('\\', '/')
+        return _hydra_initialize(config_path=cfg_root)
+
+def _write_frame_span_to_dir(frames_np, start_idx, end_idx) -> str:
+    """
+    Write frames[start_idx:end_idx] (numpy HxWx3, RGB or BGR) to a temp dir as 00000.jpg, 00001.jpg, ...
+    Returns the temp directory path. Caller must delete it.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="sam2_frames_")
+    for i, fidx in enumerate(range(start_idx, end_idx)):
+        frame = frames_np[fidx]
+        # Ensure BGR for OpenCV imwrite
+        if frame.shape[-1] == 3:
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        else:
+            raise ValueError(f"Unexpected frame shape {frame.shape}")
+        cv2.imwrite(os.path.join(tmpdir, f"{i:05d}.jpg"), bgr)
+    return tmpdir
 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+from hydra.core.global_hydra import GlobalHydra
 
+# Try Hydra >= 1.3
+try:
+    from hydra import initialize_config_dir as _hydra_initialize_config_dir
+
+    def _hydra_ctx(cfg_root: str):
+        GlobalHydra.instance().clear()
+        return _hydra_initialize_config_dir(version_base=None, config_dir=cfg_root)
+
+# Fallback to older Hydra (experimental API)
+except ImportError:
+    from hydra.experimental import initialize as _hydra_initialize
+
+    def _hydra_ctx(cfg_root: str):
+        GlobalHydra.instance().clear()
+        # older API uses 'config_path' (string path to directory)
+        return _hydra_initialize(config_path=cfg_root)
+def _preprocess_frame_1024(frame_np: np.ndarray) -> torch.Tensor:
+    """
+    Input:  frame_np [H, W, 3] uint8 (RGB)
+    Output: torch float tensor [3, 1024, 1024], normalized to ImageNet stats
+    """
+    if not isinstance(frame_np, np.ndarray):
+        raise TypeError(f"Expected numpy array, got {type(frame_np)}")
+    if frame_np.ndim != 3 or frame_np.shape[2] != 3:
+        raise ValueError(f"Expected HxWx3, got {frame_np.shape}")
+
+    t = torch.from_numpy(frame_np).permute(2, 0, 1).float() / 255.0   # [3, H, W]
+    t = F.interpolate(t.unsqueeze(0), size=(1024, 1024),
+                      mode="bilinear", align_corners=False)[0]        # [3, 1024, 1024]
+    t = T.Normalize(mean=(0.485, 0.456, 0.406),
+                    std=(0.229, 0.224, 0.225))(t)
+    return t
 class REN(nn.Module):
     def __init__(self, config):
         super(REN, self).__init__()
         self.exp_dir = os.path.join(config['logging']['save_dir'], config['logging']['exp_name'])
         os.makedirs(self.exp_dir, exist_ok=True)
-        print(f'REN Configs: {config}')
         
         # Create the models
         self.extractor_name = config['pretrained']['feature_extractors'][0]
@@ -53,7 +150,7 @@ class REN(nn.Module):
     
     def load_checkpoint(self):
         if os.path.exists(self.checkpoint_path):
-            checkpoint = torch.load(self.checkpoint_path, map_location=torch.device("cpu"))
+            checkpoint = torch.load(self.checkpoint_path, map_location="cpu")
             self.start_epoch = checkpoint['epoch']
             self.start_iter = checkpoint['iter_count']
             self.region_encoder.load_state_dict(checkpoint['region_encoder_state'])
@@ -70,7 +167,8 @@ class REN(nn.Module):
     def forward(self, images, matching_tokens=None, matching_threshold=0.0, batch_size=4, key_prefix='frame', cache_attn_maps=False):
         image_tokens = {}
         image_height, image_width = images.shape[1], images.shape[2]
-        transformed_images = torch.tensor(np.array([self.transform(image) for image in images]))
+        with torch.no_grad():
+            transformed_images = torch.stack([self.transform(image) for image in images], dim=0)
         image_number = 0
         with torch.no_grad():
             for i in tqdm(range(0, len(transformed_images), batch_size), desc='Processing image frames'):
@@ -250,7 +348,7 @@ class VideoEncoder(nn.Module):
 class CandidateSelector(nn.Module):
     def __init__(self):
         super(CandidateSelector, self).__init__()
-    # Compute the object scores at a particular frame
+
     def intra_frame_nms(self, object_scores, object_idxs, frame_ids, query_frame_number):
         selected_object_scores = object_scores.clone()
         unique_frame_ids = torch.unique(frame_ids)
@@ -277,7 +375,7 @@ class CandidateSelector(nn.Module):
                 selected_object_scores[idx] = 0.0
                 idx -= 1
         return selected_object_scores, selected_object_idxs
-    # Compute the scores of the objects over time 
+    
     def inter_frame_nms(self, object_scores, object_idxs, frame_ids, nms_threshold=None, nms_window=None):
         selected_object_scores, selected_object_idxs = [], []
 
@@ -574,21 +672,30 @@ class CandidateRefiner(nn.Module):
 
         return refined_candidates
 
+from hydra.core.global_hydra import GlobalHydra
+from hydra import initialize
 
 class VisualQueryTracker(nn.Module):
     def __init__(self, config):
-        super(VisualQueryTracker, self).__init__()
+        super().__init__()
         self.config = config
-
-        # Setup SAM2 for tracking
-        self.tracker_name = config['visual_query']['tracker_name']
+        self.tracker_name  = config['visual_query']['tracker_name']
         self.tracker_param = config['visual_query']['tracker_param']
-        self.sam2_ckpt = config['data']['sam2_ckpt']
+        self.sam2_ckpt     = config['data']['sam2_ckpt']
         self.cropping_factors = config['visual_query']['query_cropping_factors']
-
-        # Setup region encoder for generating region tokens
         self.region_encoder = REN(config['ren'])
-    
+
+        sam2_yaml = config['data'].get('sam2_config')  
+        project_root = Path(__file__).resolve().parent.parent 
+
+        if sam2_yaml is None:
+            cfg_dir = project_root / "segment_anything" / "sam2" / "configs"
+        else:
+            sam2_yaml_abs = (project_root / sam2_yaml) if not os.path.isabs(sam2_yaml) else Path(sam2_yaml)
+            cfg_dir = sam2_yaml_abs.parent.parent
+
+        self.sam2_configs_root = _abs_cfg_root(cfg_dir)
+        print(f"[SAM2] configs_root = {self.sam2_configs_root!r}")
     def forward_tracking(self, frames, selected_frame_ids, selected_object_bboxes):
         transform = T.Compose([T.ToTensor(),
                                T.Resize((1024, 1024), antialias=True),
@@ -607,7 +714,12 @@ class VisualQueryTracker(nn.Module):
             tracker = build_sam2_video_predictor(f'{self.tracker_param}', self.sam2_ckpt, device=device)
 
             # Run inference
-            with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
+            amp_ctx = (
+            torch.autocast('cuda', dtype=torch.bfloat16)
+            if torch.cuda.is_available()
+            else nullcontext()
+            )
+            with torch.inference_mode(), amp_ctx:
                 half_span_len = 500
                 init_start_frame = max(0, selected_frame_id.item() - half_span_len)
                 init_end_frame = min(frames.shape[0], selected_frame_id.item() + half_span_len)
@@ -620,7 +732,7 @@ class VisualQueryTracker(nn.Module):
                 x, y, width, height = selected_object_bbox
                 _ = tracker.add_new_points_or_box(inference_state=inference_state,
                                                   frame_idx=selected_frame_id - init_start_frame,
-                                                  obj_id=0, box=[x, y, x + width, y + height])
+                                                  obj_id=0, points=[x, y, x + width, y + height])
 
                 # Track the candidate object in the video frames
                 tracked_masks = []
@@ -648,54 +760,203 @@ class VisualQueryTracker(nn.Module):
             tracked_tokens.append(track_tokens)
         return tracked_tokens
     
-    def track(self, frames, selected_frame_ids, selected_object_bboxes, selected_object_scores, query_timestep,
-              get_tokens=True, top_p=0.75):
-        if self.tracker_name == 'sam2':
-            # Get tracks in the subsequent frames
-            future_tracks = self.forward_tracking(frames[:(query_timestep + 1)], selected_frame_ids, 
-                                                  selected_object_bboxes)
+    from contextlib import nullcontext
+    def track(self, frames, selected_frame_ids, selected_object_bboxes, selected_object_scores,
+          query_timestep, get_tokens=True, top_p=0.75):
+        """
+        Uses SAM2 with a **point prompt** at the center of the candidate bbox.
+        Returns `query_points` so your renderer can overlay them.
+        """
+        if self.tracker_name != 'sam2':
+            raise NotImplementedError(f'{self.tracker_name} not implemented.')
 
-            # Get tracks in the preceeding frames
+        # lazy imports to avoid circulars
+        import os, shutil, tempfile
+        import numpy as np
+        import torch
+        from PIL import Image
+        from sam2.build_sam import build_sam2_video_predictor
+        from .vq_utils import mask_to_bbox  # adjust if your path differs
+
+        # ------------- small helpers -------------
+        def _abs_cfg_root(p: str) -> str:
+            p = p.replace('\\', '/')
+            return p if os.path.isabs(p) else os.path.abspath(p)
+
+        def _write_frame_span_to_dir(frames_array, start_idx, end_idx, ext=".jpg"):
+            """
+            Write frames[start_idx:end_idx] as 000000.jpg, 000001.jpg, ... into a temp dir.
+            Accepts frames as NumPy (T,H,W,3) or Torch (T,H,W,3), uint8 or float in [0,1]/[0,255].
+            Ensures RGB uint8 on disk for SAM2 globbing.
+            """
+            out_dir = tempfile.mkdtemp(prefix="sam2_span_")
+            wrote = 0
+
+            for i in range(int(start_idx), int(end_idx)):
+                img = frames_array[i]
+
+                # -> numpy
+                if torch.is_tensor(img):
+                    img = img.detach().cpu().numpy()
+
+                # shape check
+                if img.ndim != 3 or img.shape[2] != 3:
+                    raise ValueError(f"Expected (H,W,3) image per frame, got {img.shape} at i={i}")
+
+                # dtype -> uint8
+                if img.dtype != np.uint8:
+                    im = img.astype(np.float32)
+                    if im.max() <= 1.0:
+                        im = im * 255.0
+                    im = np.clip(im, 0, 255).astype(np.uint8)
+                    img = im
+
+                # write RGB jpg
+                Image.fromarray(img).save(os.path.join(out_dir, f"{i - start_idx:06d}{ext}"), quality=95)
+                wrote += 1
+
+            if wrote == 0:
+                raise RuntimeError(f"_write_frame_span_to_dir wrote 0 frames into {out_dir}")
+
+            # Optional debug:
+            # print(f"[sam2 span] wrote {wrote} frames -> {out_dir}")
+            return out_dir
+        # -----------------------------------------
+
+        H, W = frames.shape[1], frames.shape[2]
+        sel_fids = selected_frame_ids.tolist() if hasattr(selected_frame_ids, 'tolist') else list(selected_frame_ids)
+        sel_boxes = selected_object_bboxes.tolist() if hasattr(selected_object_bboxes, 'tolist') else list(selected_object_bboxes)
+
+        # store seed points we actually send to SAM (for overlay)
+        all_seed_points = []   # list[list[{"frame": int, "x": int, "y": int}]]
+
+        future_tracks = []
+        past_tracks = []
+        tmpdirs_to_cleanup = []
+
+        try:
+            # -------- FUTURE (forward) --------
+            for sel_fid, sel_box in zip(sel_fids, sel_boxes):
+                x, y, w, h = sel_box
+                seed_px = int(x + w / 2.0)   # center X
+                seed_py = int(y + h / 2.0)   # center Y
+                all_seed_points.append([{"frame": int(sel_fid), "x": seed_px, "y": seed_py}])
+
+                half_span = 500
+                init_start = max(0, int(sel_fid) - half_span)
+                init_end   = min(frames.shape[0], int(sel_fid) + half_span)
+
+                span_dir = _write_frame_span_to_dir(frames, init_start, init_end, ext=".jpg")
+                tmpdirs_to_cleanup.append(span_dir)
+
+                cfg_root = _abs_cfg_root(self.sam2_configs_root)
+                with _hydra_ctx(cfg_root):
+                    predictor = build_sam2_video_predictor(self.tracker_param, self.sam2_ckpt, device=device)
+                    state = predictor.init_state(video_path=span_dir)
+
+                    # ---------- POINT prompt ----------
+                    _ = predictor.add_new_points_or_box(
+                        inference_state=state,
+                        frame_idx=int(sel_fid - init_start),
+                        obj_id=0,
+                        points=[[float(seed_px), float(seed_py)]],
+                        labels=[1],  # positive
+                    )
+
+                    track_masks = []
+                    for f_rel, _, mask_logits in predictor.propagate_in_video(state):
+                        mask = (mask_logits[0] > 0.0)[0].cpu().numpy()
+                        if mask.sum() == 0:
+                            break
+                        f_global = int(f_rel + init_start)
+                        track_masks.append([f_global, mask])
+                    future_tracks.append(track_masks)
+
+            # -------- PAST (backward) --------
+            # mirror the logic: still prompt with a point (center of the same bbox)
             reversed_frames = frames[:(query_timestep + 1)][::-1]
-            reversed_frame_ids = query_timestep - selected_frame_ids
-            past_tracks = self.forward_tracking(reversed_frames, reversed_frame_ids, selected_object_bboxes)
-            for track_idx in range(len(past_tracks)):
-                for object_idx in range(len(past_tracks[track_idx])):
-                    past_tracks[track_idx][object_idx][0] = query_timestep - past_tracks[track_idx][object_idx][0]
+            reversed_frame_ids = (query_timestep - torch.tensor(sel_fids)).tolist()
 
-            # Combine past and future tracks
-            tracked_masks = []
-            for i in range(len(selected_frame_ids)):
-                tracked_masks.append(past_tracks[i][::-1][:-1] + future_tracks[i])
+            for rfid, sel_box in zip(reversed_frame_ids, sel_boxes):
+                x, y, w, h = sel_box
+                seed_px = int(x + w / 2.0)
+                seed_py = int(y + h / 2.0)
 
-            # Get region tokens for the tracked object
+                half_span = 500
+                init_start = max(0, int(rfid) - half_span)
+                init_end   = min(reversed_frames.shape[0], int(rfid) + half_span)
+
+                span_dir = _write_frame_span_to_dir(reversed_frames, init_start, init_end, ext=".jpg")
+                tmpdirs_to_cleanup.append(span_dir)
+
+                cfg_root = _abs_cfg_root(self.sam2_configs_root)
+                with _hydra_ctx(cfg_root):
+                    predictor = build_sam2_video_predictor(self.tracker_param, self.sam2_ckpt, device=device)
+                    state = predictor.init_state(video_path=span_dir)
+
+                    # ---------- POINT prompt ----------
+                    _ = predictor.add_new_points_or_box(
+                        inference_state=state,
+                        frame_idx=int(rfid - init_start),
+                        obj_id=0,
+                        points=[[float(seed_px), float(seed_py)]],
+                        labels=[1],
+                    )
+
+                    t_masks = []
+                    for f_rel, _, mask_logits in predictor.propagate_in_video(state):
+                        mask = (mask_logits[0] > 0.0)[0].cpu().numpy()
+                        if mask.sum() == 0:
+                            break
+                        f_global_rev = int(f_rel + init_start)
+                        f_global = int(query_timestep - f_global_rev)  # map back to forward timeline
+                        t_masks.append([f_global, mask])
+                t_masks = t_masks[::-1]  # chronological
+                past_tracks.append(t_masks)
+
+            # -------- combine per object --------
+            combined = []
+            for i in range(len(sel_fids)):
+                combined.append(past_tracks[i][:-1] + future_tracks[i])  # drop dup at join
+
+            # -------- optional tokens --------
             if get_tokens:
-                tracked_tokens = self.get_tracked_tokens(frames, tracked_masks)
+                tracked_tokens = self.get_tracked_tokens(frames, combined)
             else:
-                tracked_tokens = [None] * len(tracked_masks)
-            track_scores = [selected_object_scores.item() for _ in range(len(tracked_masks))]
-                
-            # Select one track as the final prediction
-            max_score = max(track_scores)
-            score_threshold = top_p * max_score
+                tracked_tokens = [None] * len(combined)
+
+            # -------- choose final candidate --------
+            track_scores = [float(selected_object_scores.item()) for _ in range(len(combined))]
+            max_s = max(track_scores) if track_scores else 0.0
+            thr = top_p * max_s if track_scores else 0.0
+            chosen = 0
             for idx in range(len(track_scores) - 1, -1, -1):
-                if track_scores[idx] >= score_threshold:
-                    predicted_track = tracked_masks[idx]
-                    predicted_track_score = track_scores[idx]
-                    predicted_track_tokens = tracked_tokens[idx]
+                if track_scores[idx] >= thr:
+                    chosen = idx
                     break
 
-            # Convert the track from masks to bboxes
-            for track_idx in range(len(predicted_track)):
-                frame_id, object_mask = predicted_track[track_idx]
-                object_bbox = mask_to_bbox(object_mask).tolist()
-                predicted_track[track_idx] = [frame_id] + object_bbox
+            predicted_track_masks = combined[chosen]
+            predicted_track_score = track_scores[chosen]
+            predicted_track_tokens = tracked_tokens[chosen]
+            predicted_query_points = all_seed_points[chosen]  # for overlay/logging
+
+            # -------- masks -> boxes --------
+            predicted_track = []
+            for (f, m) in predicted_track_masks:
+                bx, by, bw, bh = mask_to_bbox(m)
+                predicted_track.append({
+                    "frame": int(f),
+                    "x": int(bx), "y": int(by), "w": int(bw), "h": int(bh),
+                    "x2": int(bx + bw), "y2": int(by + bh),  # keep x2,y2 for downstream tools
+                })
 
             return {
-                'predicted_track': predicted_track,
-                'predicted_track_score': predicted_track_score,
-                'predicted_track_tokens': predicted_track_tokens,
+                "predicted_track": predicted_track,                 # list of dicts {frame,x,y,w,h,x2,y2}
+                "predicted_track_score": predicted_track_score,
+                "predicted_track_tokens": predicted_track_tokens,
+                "query_points": predicted_query_points,             # list of {"frame","x","y"} seed prompts
             }
 
-        else:
-            raise NotImplementedError(f'{self.tracker_name} not implemented.')
+        finally:
+            for d in tmpdirs_to_cleanup:
+                shutil.rmtree(d, ignore_errors=True)

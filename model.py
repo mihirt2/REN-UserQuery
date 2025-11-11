@@ -3,6 +3,7 @@ import math
 import numpy as np
 import kornia
 import torch
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 import torch.nn as nn
 import torch.nn.functional as F
 import open_clip
@@ -35,7 +36,7 @@ class FeatureExtractor():
         
         feature_tokens, feature_maps, cls_tokens = [], [], []
         for i in range(0, transformed_images.shape[0], batch_size):
-            image_batch = transformed_images[i:(i + batch_size)].to(device=self.device)
+            image_batch = transformed_images[i:(i + batch_size)].to(device=device, dtype=torch.float32)
             with torch.inference_mode():
                 n = 12 - layers[0]
                 features_out = model.get_intermediate_layers(image_batch, n=n)[0]
@@ -63,7 +64,7 @@ class FeatureExtractor():
         
         feature_tokens, feature_maps, cls_tokens = [], [], []
         for i in range(0, transformed_images.shape[0], batch_size):
-            image_batch = transformed_images[i:(i + batch_size)].to(device=self.device)
+            image_batch = transformed_images[i:(i + batch_size)].to(device=device, dtype=torch.float32)
             with torch.inference_mode():
                 features_out = model.get_intermediate_layers(image_batch, return_class_token=True, n=layers)[0]
                 cls_token = features_out[1]
@@ -105,7 +106,7 @@ class FeatureExtractor():
         
     def __call__(self, model, images, resize=True):
         if model == 'dino_vitb8':
-            feature_tokens, feature_maps, cls_tokens = self.extract_dino(self.models[model], images)
+            feature_tokens, feature_maps, cls_tokens = self.extract_dino(self.models[model], images,1)
             patch_size = 8
         elif model == 'dinov2_vitl14':
             feature_tokens, feature_maps, cls_tokens = self.extract_dinov2(self.models[model], images)
@@ -358,11 +359,11 @@ class RegionEncoder(nn.Module):
         position_embedder = PositionalEmbedding2D(hidden_dim)
         if upsample_features:
             self.location_embeddings = position_embedder((image_resolution, image_resolution))
-            self.feature_embeddings = self.location_embeddings.flatten(-2).permute(1, 0).cuda()
+            self.feature_embeddings = self.location_embeddings.flatten(-2).permute(1, 0).to(device)
         else:
             self.location_embeddings = position_embedder((image_resolution, image_resolution))
             self.feature_embeddings = position_embedder((image_resolution // patch_size,
-                                                         image_resolution // patch_size)).flatten(-2).permute(1, 0).cuda()
+                                                         image_resolution // patch_size)).flatten(-2).permute(1, 0).to(device)
 
         # Instantiate prompt and feature projectors
         self.prompt_proj = nn.Linear(hidden_dim, hidden_dim)
@@ -389,12 +390,14 @@ class RegionEncoder(nn.Module):
 
     def forward(self, feature_maps, grid_points):
         feature_tokens = feature_maps.flatten(-2).permute(0, 2, 1)
+        print("[dbg] feature_tokens:", tuple(feature_tokens.shape))                 # expect [B, 484, D]
+        print("[dbg] pos_emb:", tuple(self.feature_embeddings.shape))               # expect [484, D]
         kv = feature_tokens + self.feature_embeddings[None]
 
         batch_size = feature_maps.shape[0]
         prompt_embeddings = [torch.stack([self.location_embeddings[:, point[0], point[1]] for point in grid_points[i]])
                              for i in range(batch_size)]
-        prompt_embeddings = torch.stack(prompt_embeddings).cuda()
+        prompt_embeddings = torch.stack(prompt_embeddings).to(device)
         q = self.prompt_proj(prompt_embeddings)
         all_attn_scores = []
         for layer_idx, layer in enumerate(self.region_attention_layers):

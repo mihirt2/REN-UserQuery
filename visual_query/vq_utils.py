@@ -45,43 +45,99 @@ class CenterPadding(torch.nn.Module):
 
 
 def extract_dino(model, images, batch_size=32, patch_length=8, layers=[11]):
+    import torch
+    import torchvision.transforms as T
+    import torch.nn.functional as F
+
     assert len(layers) == 1, 'Implemented for single layer extraction only.'
 
-    transform = T.Compose([T.ToTensor(),
-                           T.Resize((384, 512), antialias=True),
-                           lambda x: x.unsqueeze(0),
-                           CenterPadding(multiple=patch_length),
-                           T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))])
-    
+    transform = T.Compose([
+        T.ToTensor(),                      # float32 by default
+        T.Resize((384, 512), antialias=True),
+        lambda x: x.unsqueeze(0),
+        CenterPadding(multiple=patch_length),
+        T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
+
+    # --- keep model and inputs float32 on CPU ---
+    model = model.to('cpu').float().eval()
+
     transformed_images = []
     for image in images:
-        transformed_images.append(transform(image))
-    transformed_images = torch.cat(transformed_images, dim=0)
-    
+        transformed_images.append(transform(image))    # float32
+    transformed_images = torch.cat(transformed_images, dim=0)  # [N,3,H,W], float32 (cpu)
+
     features = []
+    print("dbg DINO dtypes:", transformed_images.dtype)
     for i in range(0, transformed_images.shape[0], batch_size):
-        image_batch = transformed_images[i:(i + batch_size)].to(device=device, dtype=torch.bfloat16)
+        # IMPORTANT: stay float32 on CPU; do NOT cast to bfloat16 here
+        image_batch = transformed_images[i:(i + batch_size)].to(device='cpu', dtype=torch.float32)
         with torch.inference_mode():
             n = 12 - layers[0]
             features_out = model.get_intermediate_layers(image_batch, n=n)[0]
             features_out = features_out[:, 1:].cpu()
-
             B, _, C = features_out.size()
             H, W = image_batch.shape[2], image_batch.shape[3]
             patch_H, patch_W = math.ceil(H / patch_length), math.ceil(W / patch_length)
             features_out = features_out.permute(0, 2, 1).view(B, C, patch_H, patch_W)
             features.append(features_out)
-            torch.cuda.empty_cache()
     features = torch.cat(features, dim=0)
     return features.detach().cpu().to(torch.float32)
 
 
+
+import torch.nn.functional as F  # make sure this import exists
+# in vq_utils.py (module-level)
+_BACKBONE = None
+_BACKBONE_KIND = None
+_BACKBONE_PATCH = None
+
+def get_backbone(requested="dino_vitb8"):
+    global _BACKBONE, _BACKBONE_KIND, _BACKBONE_PATCH
+    if _BACKBONE is not None:
+        return _BACKBONE, _BACKBONE_KIND, _BACKBONE_PATCH
+
+    # CPU-aware choice
+    if requested in ("dinov2_vitl14", "dinov2_vitb14"):
+        requested = "dinov2_vits14"  # auto-downgrade on CPU
+
+    if requested.startswith("dinov2"):
+        model = torch.hub.load('facebookresearch/dinov2', requested).eval().to("cpu")
+        kind, patch = "dinov2", 14
+    else:
+        model = torch.hub.load('facebookresearch/dino:main', 'dino_vitb8').eval().to("cpu")
+        kind, patch = "dino", 8
+
+    _BACKBONE, _BACKBONE_KIND, _BACKBONE_PATCH = model, kind, patch
+    return _BACKBONE, _BACKBONE_KIND, _BACKBONE_PATCH
+import importlib.resources as ir
+from hydra.core.global_hydra import GlobalHydra
+from hydra import initialize_config_dir
+from sam2.build_sam import build_sam2_video_predictor
+
+def _normalize_sam2_name(name_or_path: str) -> str:
+    # Accept "sam2/sam2_hiera_l", "configs/sam2/sam2_hiera_l.yaml", or a full path
+    name = name_or_path.replace(".yaml", "")
+    if name.startswith("configs/"):
+        name = name[len("configs/"):]
+    if name.startswith("segment_anything/sam2/configs/"):
+        name = name[len("segment_anything/sam2/configs/"):]
+    return name  # e.g., "sam2/sam2_hiera_l"
+
+def _build_sam2_video_predictor_safe(tracker_param: str, sam2_ckpt: str, device: str):
+    """
+    Hydra-safe builder for the SAM2 *video* predictor (has init_state / propagate APIs).
+    """
+    cfg_dir = str(ir.files("sam2").joinpath("configs"))
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=cfg_dir, version_base=None):
+        name = _normalize_sam2_name(tracker_param)
+        return build_sam2_video_predictor(name, sam2_ckpt, device=device)
+
 def extract_dino_v2(model, images, batch_size=128, patch_length=14, layers=[23]):
-    # Accept: list/iter of images, or a numpy batch [N,H,W,3], or a torch batch [N,3,H,W]/[N,H,W,3]
-    # Convert each item to numpy HWC uint8 before transforms.
     def _as_numpy_hwc(img):
         if isinstance(img, np.ndarray):
-            # Expect HWC; if CHW, convert; if dtype not uint8, scale/clamp
             if img.ndim == 3 and img.shape[-1] == 3:
                 arr = img
             elif img.ndim == 3 and img.shape[0] == 3:
@@ -90,15 +146,53 @@ def extract_dino_v2(model, images, batch_size=128, patch_length=14, layers=[23])
                 raise ValueError(f"extract_dino_v2: unsupported numpy shape {img.shape}")
             if arr.dtype != np.uint8:
                 arr = arr.astype(np.float32)
-                if arr.max() <= 1.0:
-                    arr = (arr * 255.0).clip(0, 255)
-                else:
-                    arr = arr.clip(0, 255)
+                if arr.max() <= 1.0: arr = (arr * 255.0).clip(0, 255)
+                else: arr = arr.clip(0, 255)
                 arr = arr.astype(np.uint8)
             return arr
         if torch.is_tensor(img):
-            return _to_numpy_rgb(img)  # your helper: returns HWC uint8
+            return _to_numpy_rgb(img)
         raise TypeError(f"extract_dino_v2: unsupported image type {type(img)}")
+
+    # Build a list of items
+    if isinstance(images, np.ndarray) and images.ndim == 4:
+        items = [images[i] for i in range(images.shape[0])]
+    elif torch.is_tensor(images) and images.ndim == 4:
+        items = [images[i] for i in range(images.shape[0])]
+    else:
+        items = list(images)
+
+    transform = T.Compose([
+        T.ToTensor(),                     # -> [3,H,W], float in [0,1]
+        CenterPadding(multiple=patch_length),  # center-pad to multiples of 14
+        T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
+
+    transformed_images = []
+    for image in items:
+        np_img = _as_numpy_hwc(image)
+        tens = transform(np_img)           # [3,H',W'] where H',W' % 14 == 0 (intended)
+        transformed_images.append(tens.unsqueeze(0))
+    transformed_images = torch.cat(transformed_images, dim=0)  # [B,3,H',W']
+
+    # EXTRA SAFEGUARD: enforce multiple-of-14 at batch level
+    B, C, H, W = transformed_images.shape
+    pad_h = (-H) % patch_length
+    pad_w = (-W) % patch_length
+    if pad_h or pad_w:
+        # pad (left, right, top, bottom) = (0, pad_w, 0, pad_h)
+        transformed_images = F.pad(transformed_images, (0, pad_w, 0, pad_h))
+
+    features = []
+    for i in range(0, transformed_images.shape[0], batch_size):
+        image_batch = transformed_images[i:(i + batch_size)].to(device=device, dtype=torch.bfloat16)
+        with torch.inference_mode():
+            feats = model.get_intermediate_layers(image_batch, n=layers, reshape=True)
+            features.append(torch.cat(feats, dim=1))
+            torch.cuda.empty_cache()
+    features = torch.cat(features, dim=0)
+    return features.detach().to(torch.float32)
+
 
     # If images is a batch array/tensor, iterate over first dimension
     items = []
@@ -274,19 +368,21 @@ def resolve_sam2_cfg(tracker_param: str):
     with initialize_config_dir(config_dir=cfg_dir, version_base=None):
         return compose(config_name=name)
 def extract_image_features(images, config):
-    feature_extractor = config['visual_query']['feature_extractor']
-    if feature_extractor == 'dino':
-        print('Extracting features using DINO')
-        model = torch.hub.load('facebookresearch/dino:main', 'dino_vitb8')
-        model = model.to(device=device, dtype=torch.bfloat16)
-        features = extract_dino(model, images)
+    feature_extractor = config['visual_query'].get('feature_extractor') \
+                        or config['ren']['parameters']['feature_extractor']
 
-    elif feature_extractor == 'dinov2':
+    if feature_extractor in ('dino', 'dino_vitb8'):
+        print('Extracting features using DINO')
+        model = torch.hub.load('facebookresearch/dino:main', 'dino_vitb8').eval().to('cpu').float()
+        # patch = 8 for vitb8
+        return extract_dino(model, images, batch_size=1, patch_length=8, layers=[11])
+
+    elif feature_extractor in ('dinov2', 'dinov2_vits14', 'dinov2_vitl14'):
         print('Extracting features using DINOv2')
-        model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
-        model = model.to(device=device, dtype=torch.bfloat16)
-        features = extract_dino_v2(model, images)
-    return features
+        name = 'dinov2_vits14' if 'vits14' in feature_extractor or feature_extractor == 'dinov2' else 'dinov2_vitl14'
+        model = torch.hub.load('facebookresearch/dino:main', 'dino_vitb8').eval().to('cpu').float()
+        patch_len = 14
+        return extract_dino_v2(model, images, batch_size=1, patch_length=patch_len, layers=[23])
 
 
 def upsample_feature(frame_features, new_h, new_w, padded_h, padded_w, upsampling_method='bilinear'):
@@ -505,9 +601,18 @@ def get_sam_region_from_points(sam2_ckpt, tracker_param, frames, points):
         y, x = map(int, point)
         with torch.inference_mode(), AMP_CTX:
             predictor.set_image(img)
-            mask, _, _ = predictor.predict(
-                point_coords=np.array([[x, y]]), point_labels=np.array([1]), box=None, multimask_output=True
-            )
+            # build a local box around the clicked point (limit SAM2 region)
+# size ~ 30% of min(H,W); tune between 0.2–0.4
+        box_half = int(0.3 * min(img.shape[0], img.shape[1]) * 0.5)
+        x1 = max(0, x - box_half); y1 = max(0, y - box_half)
+        x2 = min(img.shape[1]-1, x + box_half); y2 = min(img.shape[0]-1, y + box_half)
+
+        mask, _, _ = predictor.predict(
+            point_coords=np.array([[x, y]]),
+            point_labels=np.array([1]),
+            box=np.array([[x1, y1, x2, y2]]),   # <-- constrain
+            multimask_output=True
+        )
         masks.append([refine_mask(m) for m in mask])
     return masks
 
@@ -736,14 +841,30 @@ def sliding_window_cropping(image, crop_size, overlap=0.2):
 
 
 def mask_to_bbox(mask):
-    rows, cols = np.where(mask == 1)
-    x_min = np.min(cols)
-    y_min = np.min(rows)
-    x_max = np.max(cols)
-    y_max = np.max(rows)
-    width = x_max - x_min
-    height = y_max - y_min
-    return torch.tensor([x_min, y_min, width, height])
+    """
+    Input: mask as bool/0-1 array HxW (or tensor).
+    Output: [x, y, w, h] with w,h >= 1 (ints).
+    """
+    import numpy as np, torch
+    if torch.is_tensor(mask):
+        m = mask.detach().cpu().numpy()
+    else:
+        m = np.asarray(mask)
+    m = (m > 0).astype(np.uint8)
+
+    ys, xs = np.where(m)
+    if ys.size == 0:
+        return [0, 0, 1, 1]  # fallback tiny box
+
+    y1, y2 = int(ys.min()), int(ys.max())
+    x1, x2 = int(xs.min()), int(xs.max())
+
+    # +1 so a single pixel still yields size 1
+    w = max(1, int(round(x2 - x1 + 1)))
+    h = max(1, int(round(y2 - y1 + 1)))
+    return [x1, y1, w, h]
+
+
 
 
 def get_sam_pooled_tokens(frames, bboxes, sam2_ckpt, tracker_param, patch_size, config, chunk_size=8):
