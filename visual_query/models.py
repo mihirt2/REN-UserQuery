@@ -738,8 +738,8 @@ class VisualQueryTracker(nn.Module):
                 tracked_masks = []
                 for frame_id, _, mask_logits in tracker.propagate_in_video(inference_state):
                     object_mask = (mask_logits[0] > 0.0)[0].cpu().numpy()
-                    if np.sum(object_mask) == 0:
-                        break
+                  #  if np.sum(object_mask) == 0:
+                   #     break
                     tracked_masks.append([frame_id + init_start_frame, object_mask])
                 predicted_tracks.append(tracked_masks)
                 torch.cuda.empty_cache()
@@ -866,8 +866,8 @@ class VisualQueryTracker(nn.Module):
                     track_masks = []
                     for f_rel, _, mask_logits in predictor.propagate_in_video(state):
                         mask = (mask_logits[0] > 0.0)[0].cpu().numpy()
-                        if mask.sum() == 0:
-                            break
+                       # if mask.sum() == 0:
+                        #    break
                         f_global = int(f_rel + init_start)
                         track_masks.append([f_global, mask])
                     future_tracks.append(track_masks)
@@ -906,8 +906,8 @@ class VisualQueryTracker(nn.Module):
                     t_masks = []
                     for f_rel, _, mask_logits in predictor.propagate_in_video(state):
                         mask = (mask_logits[0] > 0.0)[0].cpu().numpy()
-                        if mask.sum() == 0:
-                            break
+                        #if mask.sum() == 0:
+                        #    break
                         f_global_rev = int(f_rel + init_start)
                         f_global = int(query_timestep - f_global_rev)  # map back to forward timeline
                         t_masks.append([f_global, mask])
