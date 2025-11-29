@@ -151,7 +151,6 @@ def cosine_match_for_frames(query_tokens, obj_tokens, obj_points, frame_ids, num
     Compute cosine similarity between query_tokens [Q, D] and obj_tokens [N, D].
     For each frame f, pick the single best scoring object point.
     """
-
     if query_tokens.ndim == 1:
         query_tokens = query_tokens.unsqueeze(0)
 
@@ -177,7 +176,38 @@ def cosine_match_for_frames(query_tokens, obj_tokens, obj_points, frame_ids, num
     best_obj_scores, best_q_idx = sim.max(dim=0)  # [N], [N]
     print("[cosine_match_for_frames] best_obj_scores shape:", best_obj_scores.shape)
     print("[cosine_match_for_frames] best_q_idx shape:", best_q_idx.shape)
-    # debug
+
+    per_frame_points = []
+    per_frame_best_scores = torch.full((num_frames,), -1e9, dtype=torch.float32)
+
+    for f in range(num_frames):
+        mask = (frame_ids == f)
+        if not mask.any():
+            per_frame_points.append({"frame": f, "x": 0, "y": 0})
+            print(f"[cosine_match_for_frames] WARNING. no objects in frame {f}")
+            continue
+
+        idxs = mask.nonzero(as_tuple=False).squeeze(1)  # indices into obj_tokens
+        frame_scores = best_obj_scores[idxs]
+        frame_pts = obj_points[idxs].to(torch.float32)
+
+        # Pick the single best scoring object in this frame
+        best_idx_local = torch.argmax(frame_scores)
+        best_score = frame_scores[best_idx_local]
+        best_pt = frame_pts[best_idx_local]  # [y, x]
+
+        y, x = float(best_pt[0].item()), float(best_pt[1].item())
+
+        per_frame_best_scores[f] = float(best_score.item())
+        per_frame_points.append({"frame": f, "x": int(round(x)), "y": int(round(y))})
+
+    # Now we can define best_frame, because per_frame_best_scores is filled
+    best_frame = int(torch.argmax(per_frame_best_scores).item())
+    best_score = float(per_frame_best_scores[best_frame].item())
+
+    print("[cosine_match_for_frames] per_frame_best_scores shape:", per_frame_best_scores.shape)
+    print("[cosine_match_for_frames] best_frame:", best_frame, "best_score:", best_score)
+
     def debug_topk_for_frame(frame_idx, topk=10):
         frame_mask = (frame_ids == frame_idx)
         idxs = frame_mask.nonzero(as_tuple=False).squeeze(1)
@@ -196,36 +226,8 @@ def cosine_match_for_frames(query_tokens, obj_tokens, obj_points, frame_ids, num
             i = idxs[top_indices[rank]].item()
             pt = frame_pts[top_indices[rank]]
             print(f"rank {rank}: score={s:.4f}, idx={i}, point={pt.tolist()}")
+
     debug_topk_for_frame(best_frame, topk=10)
-    per_frame_points = []
-    per_frame_best_scores = torch.full((num_frames,), -1e9, dtype=torch.float32)
-
-    for f in range(num_frames):
-        mask = (frame_ids == f)
-        if not mask.any():
-            per_frame_points.append({"frame": f, "x": 0, "y": 0})
-            print(f"[cosine_match_for_frames] WARNING. no objects in frame {f}")
-            continue
-
-        idxs = mask.nonzero(as_tuple=False).squeeze(1)  # indices into obj_tokens
-        frame_scores = best_obj_scores[idxs]
-        frame_pts = obj_points[idxs].to(torch.float32)
-
-        # Pick the single best scoring object in this frame. 
-        best_idx_local = torch.argmax(frame_scores)
-        best_score = frame_scores[best_idx_local]
-        best_pt = frame_pts[best_idx_local]  # [y, x]
-
-        y, x = float(best_pt[0].item()), float(best_pt[1].item())
-
-        per_frame_best_scores[f] = float(best_score.item())
-        per_frame_points.append({"frame": f, "x": int(round(x)), "y": int(round(y))})
-
-    best_frame = int(torch.argmax(per_frame_best_scores).item())
-    best_score = float(per_frame_best_scores[best_frame].item())
-
-    print("[cosine_match_for_frames] per_frame_best_scores shape:", per_frame_best_scores.shape)
-    print("[cosine_match_for_frames] best_frame:", best_frame, "best_score:", best_score)
 
     return best_frame, best_score, per_frame_points, per_frame_best_scores
 
